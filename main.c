@@ -34,6 +34,7 @@ static const struct gpio_dt_spec loadSwitch = GPIO_DT_SPEC_GET(LED2_NODE, gpios)
 static char json_buffer[60000];
 static struct sensor_sample minute_buffer[60];
 static int minute_index = 0;
+static struct sensor_sample read_buf[60];
 
 static uint32_t flash_address = 0;
 static int minute_counter = 0;
@@ -47,8 +48,9 @@ static struct k_timer data_timer;
 static struct k_work flash_work;
 static struct k_work json_work;
 static struct k_work sensor_fetch_work;
-/* Demo */
-// static uint8_t counter = 0;
+
+///* ================= Global Veriables ================= */
+static bool json_in_progress = false;
 
 /* ================= FLASH WRITE ================= */
 void flash_work_handler(struct k_work *work)
@@ -89,24 +91,20 @@ void flash_work_handler(struct k_work *work)
 	flash_address += sizeof(minute_buffer);
 	minute_counter++;
 	k_mutex_unlock(&flash_mutex);
-
-	/* 15 minutes complete */
-	if (minute_counter >= 15)
-	{
-		k_work_submit(&json_work);
-		minute_counter = 0;
-	}
 }
 /* ================= JSON ================= */
 void json_work_handler(struct k_work *work)
 {
 	int offset = 0;
+	static struct sensor_sample all_data[900];
+	int index = 0;
 
 	offset += snprintf(json_buffer + offset,
 					   sizeof(json_buffer) - offset,
 					   "{ \"data\": [");
 
 	k_mutex_lock(&flash_mutex, K_FOREVER);
+
 	if (flash_address < (15 * sizeof(minute_buffer)))
 	{
 		LOG_WRN("Not enough data for 15 min");
@@ -114,11 +112,10 @@ void json_work_handler(struct k_work *work)
 		return;
 	}
 
-	struct sensor_sample read_buf[60];
 	uint32_t addr = flash_address - (15 * sizeof(minute_buffer));
+
 	for (int m = 0; m < 15; m++)
 	{
-
 		int rc = flash_read(flash_dev, addr, read_buf, sizeof(read_buf));
 		if (rc != 0)
 		{
@@ -127,44 +124,45 @@ void json_work_handler(struct k_work *work)
 			return;
 		}
 
-		for (int i = 0; i < 60; i++)
-		{
-			if (offset >= sizeof(json_buffer) - 100)
-			{
-				LOG_ERR("JSON overflow");
-				k_mutex_unlock(&flash_mutex);
-				goto json_done;
-			}
-			offset += snprintf(json_buffer + offset,
-							   sizeof(json_buffer) - offset,
-							   "{\"t\":%.2f,\"h\":%.2f,\"ws\":%.2f,\"wd\":%d,\"r\":%.2f},",
-							   read_buf[i].temp / 100.0,
-							   read_buf[i].hum / 100.0,
-							   read_buf[i].wind_speed / 100.0,
-							   read_buf[i].wind_dir,
-							   read_buf[i].rain / 100.0);
-		}
-
+		memcpy(&all_data[index], read_buf, sizeof(read_buf));
+		index += 60;
 		addr += sizeof(read_buf);
 	}
 	k_mutex_unlock(&flash_mutex);
 
-	/* fix comma */
-	if (offset > 0 && json_buffer[offset - 1] == ',')
+	/* ---- BUILD JSON (UNLOCKED) ---- */
+	for (int i = 0; i < index; i++)
 	{
-		json_buffer[offset - 1] = ']';
-	}
-	else
-	{
-		json_buffer[offset++] = ']';
-	}
+		if (offset >= sizeof(json_buffer) - 128)
+		{
+			LOG_ERR("JSON buffer full, truncating");
 
-	offset += snprintf(json_buffer + offset,
-					   sizeof(json_buffer) - offset,
-					   "}");
+			if (offset > 0 && json_buffer[offset - 1] == ',')
+				json_buffer[offset - 1] = ']';
+			else
+				json_buffer[offset++] = ']';
 
-json_done:
-	LOG_INF("JSON READY");
+			offset += snprintf(json_buffer + offset,
+							   sizeof(json_buffer) - offset,
+							   "}");
+			return;
+		}
+
+		offset += snprintf(json_buffer + offset,
+						   sizeof(json_buffer) - offset,
+						   "{\"t\":%.2f,\"h\":%.2f,\"w\":%d.%02d,\"d\":%d,\"r\":%.2f},",
+						   all_data[i].temp / 100.0,
+						   all_data[i].hum / 100.0,
+						   (int)(all_data[i].wind_speed / 100.0),
+						   (int)(fmod(all_data[i].wind_speed, 100.0)),
+						   all_data[i].wind_dir,
+						   all_data[i].rain / 100.0);
+	}
+	k_mutex_lock(&flash_mutex, K_FOREVER);
+	minute_counter = 0;
+	json_in_progress = false;
+	k_mutex_unlock(&flash_mutex);
+	LOG_INF("JSON READY (%d bytes)", offset);
 }
 /* ================= TIMER ================= */
 void data_timer_handler(struct k_timer *dummy)
@@ -220,6 +218,23 @@ void sensor_thread()
 		k_msleep(1000);
 	}
 }
+void json_thread(void *p1, void *p2, void *p3)
+{
+	while (1)
+	{
+		k_sleep(K_SECONDS(1));
+
+		k_mutex_lock(&flash_mutex, K_FOREVER);
+		int ready = (minute_counter >= 15);
+
+		if (ready && !json_in_progress)
+		{
+			json_in_progress = true;
+			k_work_submit(&json_work);
+		}
+		k_mutex_unlock(&flash_mutex);
+	}
+}
 /* ================= MAIN ================= */
 int main(void)
 {
@@ -248,3 +263,4 @@ int main(void)
 	}
 }
 K_THREAD_DEFINE(sensor_thread_id, 1024, sensor_thread, NULL, NULL, NULL, 7, 0, 0);
+K_THREAD_DEFINE(json_thread_id, 4096, json_thread, NULL, NULL, NULL, 7, 0, 0);
